@@ -28,12 +28,12 @@ export default Plugin.define({
 
     const reviewerModel = ctx.options.model as ReviewerModel;
 
-    const pending = new Map<string, PermissionRequest>();
+    const abort = new AbortController();
 
     const handle = (async () => {
       try {
         log.log("subscribing to event stream...");
-        for await (const event of ctx.event.subscribe()) {
+        for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
           const type = (event as { type?: string }).type ?? "unknown";
 
           if (type !== "permission.v2.asked") continue;
@@ -42,7 +42,6 @@ export default Plugin.define({
           if (!data) continue;
 
           log.logJSON("permission asked", data);
-          pending.set(data.id, data);
           void reviewAndReply(client, data, reviewerModel, log).catch((err: unknown) => {
             const e = err instanceof Error ? err.message : String(err);
             log.log(`review error: ${e}`);
@@ -57,6 +56,7 @@ export default Plugin.define({
 
     return () => {
       log.log("=== plugin unloaded ===");
+      abort.abort();
       handle.catch(() => {});
     };
   },

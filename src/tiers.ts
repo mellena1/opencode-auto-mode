@@ -32,7 +32,7 @@ const AUTO_BLOCKED_SHELL = [
 ];
 
 function hasShellMetacharacters(command: string): boolean {
-  if (/[<>]/.test(command) && !/>>?/.test(command) === false) return true;
+  if (/<|(?<![>])>(?![>])/.test(command)) return true;
   if (/>>?|2>&1|2>/.test(command)) return true;
   if (/`|\$\(/.test(command)) return true;
   if (/(?<!\|)\|(?!\|)/.test(command)) return true;

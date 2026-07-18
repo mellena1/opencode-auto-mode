@@ -21,13 +21,16 @@ export interface ReviewResult {
 export function buildReviewPrompt(req: PermissionRequest): string {
   const action = req.action;
   const resources = req.resources.map((r) => `  - ${r}`).join("\n");
+  const save = req.save && req.save.length > 0
+    ? `\n  Save patterns:\n${req.save.map((s) => `    - ${s}`).join("\n")}`
+    : "";
 
   return `You are a security reviewer for an AI coding agent. Your job is to decide whether to approve, deny, or escalate a permission request.
 
 The agent requested permission for:
   Action: ${action}
   Resources:
-${resources}
+${resources}${save}
 
 === RULES ===
 1. Read-only operations (read, glob, grep, websearch, webfetch to public URLs) → ALLOW
@@ -64,13 +67,13 @@ export function parseDecision(text: string): ReviewResult {
   // Fallback: look for keywords anywhere
   const lower = trimmed.toLowerCase();
   if (lower.startsWith("allow")) {
-    return { decision: "allow", reason: trimmed.slice(60) || "approved by reviewer" };
+    return { decision: "allow", reason: trimmed.slice(5).trim() || "approved by reviewer" };
   }
   if (lower.startsWith("deny")) {
-    return { decision: "deny", reason: trimmed.slice(60) || "denied by reviewer" };
+    return { decision: "deny", reason: trimmed.slice(4).trim() || "denied by reviewer" };
   }
   if (lower.startsWith("ask")) {
-    return { decision: "ask", reason: trimmed.slice(60) || "escalated to user" };
+    return { decision: "ask", reason: trimmed.slice(3).trim() || "escalated to user" };
   }
 
   // Unclear response → ask the user

@@ -38,6 +38,15 @@ export async function makeClient() {
     headers: Service.headers(endpoint) ?? {},
   });
 
+  if (
+    typeof (client as Record<string, unknown>).permission !== "object" ||
+    typeof (client as Record<string, unknown>).generate !== "object"
+  ) {
+    throw new Error(
+      "OpenCode client missing expected permission.generate APIs",
+    );
+  }
+
   return client as {
     permission: {
       reply: (input: {
