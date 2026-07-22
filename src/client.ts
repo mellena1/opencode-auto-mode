@@ -15,7 +15,7 @@ export async function makeClient() {
   try {
     files = fs
       .readdirSync(dir)
-      .filter((f) => f.startsWith("service-") && f.endsWith(".json"));
+      .filter((f) => (f.startsWith("service-") || f === "service.json") && f.endsWith(".json"));
   } catch {
     throw new Error("Could not read OpenCode state directory");
   }

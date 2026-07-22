@@ -169,6 +169,14 @@ async function reviewWithLLM(
     } catch (err) {
       lastError = err instanceof Error ? err.message : JSON.stringify(err);
       log.log(`attempt ${attempt} failed: ${lastError}`);
+      const tag =
+        err && typeof err === "object" && "_tag" in err
+          ? (err as Record<string, unknown>)._tag
+          : undefined;
+      if (tag === "PermissionNotFoundError") {
+        log.log("permission request no longer exists — skipping retries");
+        break;
+      }
     }
   }
 
