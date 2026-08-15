@@ -1,7 +1,8 @@
-import { Plugin } from "@opencode-ai/plugin/v2";
+import { Plugin } from "@opencode-ai/plugin";
 import { createLogger } from "./logger.js";
 import { makeClient } from "./client.js";
 import { classify } from "./tiers.js";
+import { recordDecision } from "./state.js";
 import {
   buildReviewPrompt,
   parseDecision,
@@ -36,7 +37,7 @@ export default Plugin.define({
         for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
           const type = (event as { type?: string }).type ?? "unknown";
 
-          if (type !== "permission.v2.asked") continue;
+          if (type !== "permission.asked") continue;
 
           const data = (event as { data?: PermissionRequest }).data;
           if (!data) continue;
@@ -73,6 +74,13 @@ async function reviewAndReply(
 
   // Tier 1: Auto-allow — safe commands skip the LLM entirely
   if (classification.tier === "auto-allow") {
+    recordDecision({
+      requestID: req.id,
+      sessionID: req.sessionID,
+      decision: "allow",
+      reason: classification.reason,
+      at: Date.now(),
+    });
     try {
       await client.permission.reply({
         sessionID: req.sessionID,
@@ -90,6 +98,13 @@ async function reviewAndReply(
 
   // Tier 2: Auto-deny — dangerous commands blocked immediately
   if (classification.tier === "auto-deny") {
+    recordDecision({
+      requestID: req.id,
+      sessionID: req.sessionID,
+      decision: "deny",
+      reason: classification.reason,
+      at: Date.now(),
+    });
     try {
       await client.permission.reply({
         sessionID: req.sessionID,
@@ -141,6 +156,14 @@ async function reviewWithLLM(
       const { decision, reason } = parseDecision(result.text);
       log.log(`decision: ${decision} — ${reason}`);
 
+      recordDecision({
+        requestID: req.id,
+        sessionID: req.sessionID,
+        decision,
+        reason,
+        at: Date.now(),
+      });
+
       if (decision === "allow") {
         await client.permission.reply({
           sessionID: req.sessionID,
@@ -183,6 +206,13 @@ async function reviewWithLLM(
   log.log(
     `all review attempts failed: ${lastError} — falling back to user`,
   );
+  recordDecision({
+    requestID: req.id,
+    sessionID: req.sessionID,
+    decision: "ask",
+    reason: `review failed: ${lastError ?? "unknown error"}`,
+    at: Date.now(),
+  });
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {

@@ -82,13 +82,37 @@ Add to your project's `opencode.jsonc`:
   location's default model.
 - **`permissions`** — force `ask` for tools you want the plugin to review.
   Without this, OpenCode's built-in permission rules apply and the plugin
-  may never see a `permission.v2.asked` event.
+  may never see a `permission.asked` event.
+
+## TUI status indicator
+
+The same package ships a TUI plugin (`./tui` entrypoint, `src/tui.tsx`) that
+shows what auto-mode is doing while you work:
+
+- A small badge in the top-right corner of the screen (above dialogs):
+  spinner while the reviewer LLM is thinking, `⚠ needs your approval` when
+  it escalates to you. The badge clears as soon as the permission is
+  answered — no toasts, no footer clutter.
+- `allow` / `deny` commands (command palette + keybindings) so you can
+  answer a pending permission yourself at any time.
+
+Local file plugins for the TUI are discovered automatically from
+`.opencode/plugins/tui/` (the runtime does not read project `tui.json`):
+
+```ts
+// .opencode/plugins/tui/opencode-auto-mode.tsx
+export { default } from "../../../src/tui.tsx";
+```
+
+- **`keybinds.allow` / `keybinds.deny`** — keybindings for the manual
+  allow/deny commands (defaults: `ctrl+alt+a` / `ctrl+alt+d`).
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Main plugin: subscribes to `permission.v2.asked` events, classifies commands, calls the LLM reviewer, and replies to the permission request via the OpenCode HTTP API |
+| `src/index.ts` | Server plugin: subscribes to `permission.asked` events, classifies commands, calls the LLM reviewer, and replies to the permission request via the OpenCode HTTP API |
+| `src/tui.tsx` | TUI plugin: shows review-in-progress / allow-deny status in the prompt footer, plus manual allow/deny commands and keybindings |
 | `src/client.ts` | Builds an authenticated OpenCode HTTP client by reading the server's registration file — used for `permission.reply` and `generate.text` (not exposed on the plugin `ctx`) |
 | `src/tiers.ts` | Command classification: auto-allow, auto-deny, or defer to LLM review |
 | `src/reviewer.ts` | Builds the review prompt for the LLM and parses ALLOW/DENY/ASK decisions |
@@ -102,15 +126,18 @@ tail -f /tmp/opencode-auto-mode/events.log
 
 ## Limitations
 
-- **No TUI status indicator**: OpenCode v2 does not yet support loading
-  external TUI plugins (the V1 TUI plugin API exists but the config
-  discovery path is not wired up for project-local plugins). The plugin
-  runs entirely in the server process. Permission review happens silently
-  in the background.
-- **Self-client**: the plugin builds its own HTTP client to call
+- **Self-client**: the server plugin builds its own HTTP client to call
   `permission.reply` and `generate.text` since the plugin `ctx` does not
   expose these methods.
 - **Log path**: logs are written to `/tmp/opencode-auto-mode/` to avoid
   triggering config reload loops. Writing inside `.opencode/` or the
   project root causes the server to detect a file change and reload the
   plugin in an infinite loop.
+- **No reason in the result UI**: the `permission.replied` event carries
+  the reply type but not the reviewer's reason message, so the badge shows
+  only the state (reviewing / needs your approval), never the LLM's
+  explanation.
+- **Sticky host permission dialog (17444)**: on some `next` builds the
+  host's permission dialog does not dismiss itself when a permission is
+  answered by a plugin — the dialog stays until answered manually. This is
+  a host bug; upgrading OpenCode fixes it.

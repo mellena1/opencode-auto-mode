@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "../src/index.ts",
+      "options": {
+        "model": { "id": "deepseek-v4-flash", "providerID": "opencode-go" }
+      }
+    }
+  ]
+}
