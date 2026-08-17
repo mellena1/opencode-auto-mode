@@ -1,6 +1,6 @@
 {
   "name": "@mellena1/opencode-auto-mode",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "OpenCode v2 plugin that mimics Claude Code auto mode: a cheap LLM auto-approves/denies permission requests, falling back to the user when uncertain.",
   "type": "module",
   "license": "MIT",
@@ -19,14 +19,15 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode-ai/client": "0.0.0-next-17444",
-    "@opencode-ai/plugin": "0.0.0-next-17444",
+    "@opencode-ai/client": "0.0.0-beta-17498",
+    "@opencode-ai/plugin": "0.0.0-beta-17498",
     "@opentui/core": "^0.5.3",
     "@opentui/solid": "^0.5.3",
+    "effect": "4.0.0-beta.101",
     "solid-js": "^1.9.0"
   },
   "devDependencies": {
-    "@opencode-ai/theme": "0.0.0-next-17444",
+    "@opencode-ai/theme": "0.0.0-beta-17498",
     "@opentui/keymap": "^0.5.3",
     "@types/node": "^24.0.0",
     "typescript": "^5.8.2"

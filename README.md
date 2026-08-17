@@ -91,17 +91,33 @@ shows what auto-mode is doing while you work:
 
 - A small badge in the top-right corner of the screen (above dialogs):
   spinner while the reviewer LLM is thinking, `⚠ needs your approval` when
-  it escalates to you. The badge clears as soon as the permission is
-  answered — no toasts, no footer clutter.
+  it escalates to you. The badge tracks the host's own permission store, so
+  it clears as soon as the permission is answered — no toasts, no footer
+  clutter.
 - `allow` / `deny` commands (command palette + keybindings) so you can
   answer a pending permission yourself at any time.
 
-Local file plugins for the TUI are discovered automatically from
-`.opencode/plugins/tui/` (the runtime does not read project `tui.json`):
+The TUI plugin is loaded via `cli.json` (the runtime discovers project
+`.opencode/plugins/tui/` files too, but `cli.json` is the reliable global
+path):
 
-```ts
-// .opencode/plugins/tui/opencode-auto-mode.tsx
-export { default } from "../../../src/tui.tsx";
+```jsonc
+// ~/.config/opencode/cli.json
+{
+  "plugins": [
+    { "package": "@mellena1/opencode-auto-mode@0.3.0", "options": {} }
+  ]
+}
+```
+
+For local development, point the package field at the local checkout:
+
+```jsonc
+{
+  "plugins": [
+    { "package": "/path/to/opencode-auto-mode/src/tui.tsx", "options": {} }
+  ]
+}
 ```
 
 - **`keybinds.allow` / `keybinds.deny`** — keybindings for the manual
@@ -111,8 +127,8 @@ export { default } from "../../../src/tui.tsx";
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Server plugin: subscribes to `permission.asked` events, classifies commands, calls the LLM reviewer, and replies to the permission request via the OpenCode HTTP API |
-| `src/tui.tsx` | TUI plugin: shows review-in-progress / allow-deny status in the prompt footer, plus manual allow/deny commands and keybindings |
+| `src/index.ts` | Server plugin (Effect API): subscribes to `permission.asked` events, classifies commands, calls the LLM reviewer, and replies to the permission request via the OpenCode HTTP API. Long-running work is forked into the plugin's scope so activation completes promptly |
+| `src/tui.tsx` | TUI plugin: shows review-in-progress / allow-deny status in a top-right badge (driven by the host's permission store), plus manual allow/deny commands and keybindings |
 | `src/client.ts` | Builds an authenticated OpenCode HTTP client by reading the server's registration file — used for `permission.reply` and `generate.text` (not exposed on the plugin `ctx`) |
 | `src/tiers.ts` | Command classification: auto-allow, auto-deny, or defer to LLM review |
 | `src/reviewer.ts` | Builds the review prompt for the LLM and parses ALLOW/DENY/ASK decisions |
