@@ -90,19 +90,16 @@ function Badge(props: {
     if (!p || p.escalated) return false;
     return Date.now() - p.at < REVIEW_MS;
   });
-  const glyph = createMemo(() => (thinking() ? SPINNER_FRAMES[frame()] : "⚠"));
+  // The glyph spins for the whole pending period — also while escalated —
+  // so there's always visible activity while a permission is up.
+  const glyph = createMemo(() => SPINNER_FRAMES[frame()]);
   const label = createMemo(() => (thinking() ? "reviewing" : "needs your approval"));
 
   return (
     <box>
-      <Show
-        when={props.pending()}
-        fallback={<text fg={theme.text.subdued}>● auto-mode</text>}
-      >
-        <text fg={theme.text.feedback.warning.default}>
-          {glyph()} auto-mode {label()}
-        </text>
-      </Show>
+      <text fg={theme.text.feedback.warning.default}>
+        {glyph()} auto-mode {label()}
+      </text>
     </box>
   );
 }
