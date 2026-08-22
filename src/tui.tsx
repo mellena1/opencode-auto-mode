@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { createEffect, createMemo, createSignal, onCleanup, Show, type JSX } from "solid-js";
+import { createMemo, createSignal, Show, type JSX } from "solid-js";
 import { Plugin } from "@opencode-ai/plugin/tui";
 import type { Context } from "@opencode-ai/plugin/tui/context";
 import type { ResolvedTheme } from "@opencode-ai/theme/tui";
@@ -28,16 +28,6 @@ function str(value: unknown, fallback: string): string {
 
 function truncate(value: string, max: number): string {
   return value.length > max ? value.slice(0, max - 1) + "…" : value;
-}
-
-function useSpinner(active: () => boolean): () => number {
-  const [frame, setFrame] = createSignal(0);
-  createEffect(() => {
-    if (!active()) return;
-    const id = setInterval(() => setFrame((f) => (f + 1) % SPINNER_FRAMES.length), 120);
-    onCleanup(() => clearInterval(id));
-  });
-  return frame;
 }
 
 // `ctx.data.session.list()` is unreliable across betas: on 0.0.0-beta-17823
@@ -83,23 +73,22 @@ function Badge(props: {
     ],
   }));
 
-  const frame = useSpinner(() => props.pending() !== undefined);
-
   const thinking = createMemo(() => {
     const p = props.pending();
     if (!p || p.escalated) return false;
     return Date.now() - p.at < REVIEW_MS;
   });
-  // The glyph spins for the whole pending period — also while escalated —
-  // so there's always visible activity while a permission is up.
-  const glyph = createMemo(() => SPINNER_FRAMES[frame()]);
   const label = createMemo(() => (thinking() ? "reviewing" : "needs your approval"));
 
+  // The glyph comes from opentui's intrinsic <spinner>, not our own timer:
+  // npm installs can split solid-js into two instances (the plugin's exact
+  // pin vs @opentui/solid's peer pin), which freezes timer-driven signal
+  // renders. The spinner element animates on its own renderable, so the
+  // badge works regardless of how dependencies resolve.
   return (
-    <box>
-      <text fg={theme.text.feedback.warning.default}>
-        {glyph()} auto-mode {label()}
-      </text>
+    <box flexDirection="row" gap={1}>
+      <spinner frames={SPINNER_FRAMES} interval={120} />
+      <text fg={theme.text.feedback.warning.default}>auto-mode {label()}</text>
     </box>
   );
 }
