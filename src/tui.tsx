@@ -87,7 +87,11 @@ function Badge(props: {
   // badge works regardless of how dependencies resolve.
   return (
     <box flexDirection="row" gap={1}>
-      <spinner frames={SPINNER_FRAMES} interval={120} />
+      <spinner
+        frames={SPINNER_FRAMES}
+        interval={120}
+        color={theme.text.feedback.warning.default}
+      />
       <text fg={theme.text.feedback.warning.default}>auto-mode {label()}</text>
     </box>
   );
