@@ -228,19 +228,24 @@ export default Plugin.define({
       }
     };
 
-    // Bottom bar, right end of the composer footer — alongside the hint row
-    // ("shift+tab agents  ctrl+p commands").
+    // Top-right overlay, above the permission dialog (which covers the bottom
+    // bar). Only visible while a permission request is pending: spinner while
+    // reviewing, ⚠ when it needs the user.
     const disposeBadge = ctx.ui.slot({
-      append: "prompt.footer",
+      append: "app",
       render: () => (
-        <Badge
-          pending={mostRecent}
-          answer={answer}
-          allowKey={allowKey}
-          denyKey={denyKey}
-          keymap={ctx.keymap}
-          theme={() => ctx.theme}
-        />
+        <Show when={mostRecent() !== undefined}>
+          <box position="absolute" top={0} right={0} zIndex={10_000}>
+            <Badge
+              pending={mostRecent}
+              answer={answer}
+              allowKey={allowKey}
+              denyKey={denyKey}
+              keymap={ctx.keymap}
+              theme={() => ctx.theme}
+            />
+          </box>
+        </Show>
       ),
     });
 
