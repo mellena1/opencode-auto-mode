@@ -9,8 +9,9 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 const REVIEW_MS = 30_000;
 const MAX_RESOURCE = 48;
 const POLL_MS = 1_000;
+const STALE_MS = REVIEW_MS + 60_000;
 
-type Reply = "once" | "always" | "reject";
+type Reply = "once" | "reject";
 
 type Pending = {
   requestID: string;
@@ -39,6 +40,11 @@ function useSpinner(active: () => boolean): () => number {
   return frame;
 }
 
+// `ctx.data.session.list()` is unreliable across betas: on 0.0.0-beta-17823
+// the host's session store memo never invalidates, so iterating sessions to
+// find pending permissions sees an empty list forever. Instead the badge is
+// fed by permission events directly, and reconciled against the server
+// plugin's decision file so missed events self-heal within a second.
 function Badge(props: {
   pending: () => Pending | undefined;
   answer: (reply: "once" | "reject") => Promise<void>;
@@ -88,7 +94,7 @@ function Badge(props: {
   const label = createMemo(() => (thinking() ? "reviewing" : "needs your approval"));
 
   return (
-    <box position="absolute" top={0} right={0} zIndex={10_000}>
+    <box>
       <Show
         when={props.pending()}
         fallback={<text fg={theme.text.subdued}>● auto-mode</text>}
@@ -109,79 +115,106 @@ export default Plugin.define({
     const allowKey = str(keybinds.allow, "ctrl+alt+a");
     const denyKey = str(keybinds.deny, "ctrl+alt+d");
 
-    // The TUI host's own permission store (ctx.data.session.permission) is
-    // fed by the host's event stream — the same store that drives the
-    // permission dialog the host displays. We read from it instead of
-    // subscribing to events ourselves, so the badge tracks the host's
-    // permission lifecycle exactly.
-    const [escalated, setEscalated] = createSignal<Record<string, boolean>>({});
+    // Own pending list, fed by events. Keeping it locally (instead of reading
+    // the host's session store) makes the badge independent of host store
+    // behavior across betas.
+    const [pending, setPending] = createSignal<Pending[]>([]);
     const firstSeen = new Map<string, number>();
 
-    const derivedPending = (): Pending[] => {
-      const requests: Pending[] = [];
-      for (const session of ctx.data.session.list()) {
-        const perms = ctx.data.session.permission.list(session.id);
-        if (!perms || perms.length === 0) continue;
-        for (const request of perms) {
-          if (!firstSeen.has(request.id)) firstSeen.set(request.id, Date.now());
-          requests.push({
-            requestID: request.id,
-            sessionID: request.sessionID,
-            action: request.action,
-            resource: truncate(request.resources.join(" ") || request.action, MAX_RESOURCE),
-            at: firstSeen.get(request.id) ?? Date.now(),
-            escalated: escalated()[request.id] ?? false,
-          });
-        }
-      }
-      // The host appends to each session's list on `permission.asked`, so the
-      // last entry of the last session is the most recent request.
-      return requests;
+    const addPending = (data: {
+      id: string;
+      sessionID: string;
+      action: string;
+      resources: readonly string[];
+    }) => {
+      if (pending().some((p) => p.requestID === data.id)) return;
+      const at = firstSeen.get(data.id) ?? Date.now();
+      firstSeen.set(data.id, at);
+      setPending((prev) => [
+        ...prev,
+        {
+          requestID: data.id,
+          sessionID: data.sessionID,
+          action: data.action,
+          resource: truncate(data.resources.join(" ") || data.action, MAX_RESOURCE),
+          at,
+          escalated: false,
+        },
+      ]);
     };
 
+    const removePending = (requestID: string) => {
+      firstSeen.delete(requestID);
+      setPending((prev) => prev.filter((p) => p.requestID !== requestID));
+    };
+
+    // Primary channel: the host data bus. Some host versions forward only a
+    // subset of event types, so the raw server stream below is the fallback;
+    // handlers dedupe by request ID.
+    const unsubs = [
+      ctx.data.on("permission.asked", (event) => addPending(event.data)),
+      ctx.data.on("permission.replied", (event) => removePending(event.data.requestID)),
+    ];
+
+    // Fallback channel: the raw server event stream, with reconnection.
+    const abort = new AbortController();
+    const runStream = async () => {
+      while (!abort.signal.aborted) {
+        try {
+          for await (const event of ctx.client.event.subscribe({ signal: abort.signal })) {
+            if (event.type === "permission.asked") addPending(event.data);
+            else if (event.type === "permission.replied") removePending(event.data.requestID);
+          }
+        } catch {
+          // fall through to reconnect
+        }
+        if (abort.signal.aborted) return;
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    };
+    void runStream();
+
+    // Reconcile with the server plugin's recorded decisions: escalate on
+    // "ask", drop requests it resolved even when a reply event was missed,
+    // and prune requests that outlived the review window unanswered.
+    const poll = setInterval(() => {
+      const decisions = readDecisions();
+      const now = Date.now();
+      let dirty = false;
+      const next: Pending[] = [];
+      for (const p of pending()) {
+        const record = decisions[p.requestID];
+        if (record) {
+          if (record.decision === "allow" || record.decision === "deny") {
+            dirty = true;
+            continue;
+          }
+          if (record.decision === "ask" && !p.escalated) {
+            next.push({ ...p, escalated: true });
+            dirty = true;
+            continue;
+          }
+        } else if (now - p.at >= STALE_MS) {
+          dirty = true;
+          continue;
+        }
+        next.push(p);
+      }
+      if (dirty) setPending(next);
+    }, POLL_MS);
+
     const mostRecent = createMemo(() => {
-      const requests = derivedPending();
+      const requests = pending();
       return requests.length > 0 ? requests[requests.length - 1] : undefined;
     });
 
-    // Escalation polling: mark requests as "needs your approval" when the
-    // server plugin decided to ask the user, or once a request has been
-    // pending past the review window.
-    const poll = setInterval(() => {
-      const current = derivedPending();
-      if (current.length === 0) {
-        if (Object.keys(escalated()).length > 0) setEscalated({});
-        return;
-      }
-      const decisions = readDecisions();
-      const next = { ...escalated() };
-      const now = Date.now();
-      let dirty = false;
-      for (const request of current) {
-        const record = decisions[request.requestID];
-        const shouldEscalate =
-          record?.decision === "ask" || now - request.at >= REVIEW_MS;
-        if (shouldEscalate && !next[request.requestID]) {
-          next[request.requestID] = true;
-          dirty = true;
-        }
-      }
-      for (const id of Object.keys(next)) {
-        if (!current.some((request) => request.requestID === id)) {
-          delete next[id];
-          dirty = true;
-        }
-      }
-      if (dirty) setEscalated(next);
-    }, POLL_MS);
-
     const answer = async (reply: "once" | "reject") => {
-      const pending = mostRecent();
-      if (!pending) return;
+      const pendingRequest = mostRecent();
+      if (!pendingRequest) return;
       try {
         await ctx.client.permission.reply({
-          sessionID: pending.sessionID,
-          requestID: pending.requestID,
+          sessionID: pendingRequest.sessionID,
+          requestID: pendingRequest.requestID,
           reply,
         });
       } catch (err) {
@@ -195,8 +228,10 @@ export default Plugin.define({
       }
     };
 
+    // Bottom bar, right end of the composer footer — alongside the hint row
+    // ("shift+tab agents  ctrl+p commands").
     const disposeBadge = ctx.ui.slot({
-      append: "app",
+      append: "prompt.footer",
       render: () => (
         <Badge
           pending={mostRecent}
@@ -210,6 +245,8 @@ export default Plugin.define({
     });
 
     return () => {
+      for (const unsub of unsubs) unsub();
+      abort.abort();
       clearInterval(poll);
       disposeBadge();
     };
