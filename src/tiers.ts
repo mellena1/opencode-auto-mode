@@ -40,7 +40,7 @@ function hasShellMetacharacters(command: string): boolean {
   return false;
 }
 
-export function classify(action: string, resources: string[]): Classification {
+export function classify(action: string, resources: readonly string[]): Classification {
   if (action === "shell") {
     const command = resources[0] ?? "";
     if (!command) return { tier: "auto-allow", reason: "empty command" };

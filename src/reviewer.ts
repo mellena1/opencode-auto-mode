@@ -1,14 +1,7 @@
 interface PermissionRequest {
-  id: string;
-  sessionID: string;
   action: string;
   resources: string[];
-  save?: string[];
-  source?: {
-    type: string;
-    messageID: string;
-    callID: string;
-  };
+  agent?: string;
 }
 
 export type Decision = "allow" | "deny" | "ask";
@@ -21,16 +14,14 @@ export interface ReviewResult {
 export function buildReviewPrompt(req: PermissionRequest): string {
   const action = req.action;
   const resources = req.resources.map((r) => `  - ${r}`).join("\n");
-  const save = req.save && req.save.length > 0
-    ? `\n  Save patterns:\n${req.save.map((s) => `    - ${s}`).join("\n")}`
-    : "";
+  const agent = req.agent ? `\n  Agent: ${req.agent}` : "";
 
   return `You are a security reviewer for an AI coding agent. Your job is to decide whether to approve, deny, or escalate a permission request.
 
-The agent requested permission for:
+The agent requested permission for:${agent}
   Action: ${action}
   Resources:
-${resources}${save}
+${resources}
 
 === RULES ===
 1. Read-only operations (read, glob, grep, websearch, webfetch to public URLs) → ALLOW

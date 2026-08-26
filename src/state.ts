@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-export type DecisionKind = "allow" | "deny" | "ask";
+export type DecisionKind = "reviewing" | "allow" | "deny" | "ask";
 
 export interface DecisionRecord {
   requestID: string;
@@ -9,6 +9,11 @@ export interface DecisionRecord {
   decision: DecisionKind;
   reason: string;
   at: number;
+  // Only present on "reviewing" records: the evaluate hook runs before a
+  // permission request exists, so there is no real request ID yet. Records
+  // use a synthetic ID and carry enough context for the TUI badge to render.
+  action?: string;
+  resources?: string[];
 }
 
 export const STATE_FILE = "/tmp/opencode-auto-mode/state.json";

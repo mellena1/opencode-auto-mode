@@ -6,29 +6,39 @@ LLM reviews each permission request and auto-**approves**, auto-**denies**, or
 
 ## How it works
 
+The plugin registers a `permission.evaluate` hook, which OpenCode runs after
+its own permission rules are evaluated but before an action runs or a
+permission prompt is published:
+
 ```
-permission.v2.asked event
-         │
-         ▼
-   classify (tier 1/2/3)
-         │
-    ┌────┼────────┐
-    ▼    ▼        ▼
- auto-  auto-   LLM review
- allow  deny    (tier 3)
-    │    │        │
-    ▼    ▼        ▼
- reply  reply   LLM decides
- "once" "reject"  │
-                   │
-              ┌────┼────┐
-              ▼    ▼    ▼
-            ALLOW DENY  ASK
-              │    │    │
-              ▼    ▼    ▼
-           reply  reply  (no reply —
-           "once" "reject" user decides)
+permission evaluation (after config rules)
+          │
+          ▼
+    classify (tier 1/2/3)
+          │
+     ┌────┼────────┐
+     ▼    ▼        ▼
+  auto-  auto-   LLM review
+  allow  deny    (tier 3)
+     │    │        │
+     ▼    ▼        ▼
+  effect effect  LLM decides
+  allow  deny     │
+                  │
+             ┌────┼────┐
+             ▼    ▼    ▼
+           ALLOW DENY  ASK
+             │    │    │
+             ▼    ▼    ▼
+          effect effect effect "ask"
+          allow  deny   (+ reason shown
+                         in the permission dialog)
 ```
+
+Because the hook decides *before* the prompt is published, there is no race
+with the host's permission dialog: when the plugin allows or denies, no dialog
+appears at all; when it escalates, the dialog opens with the reviewer's
+explanation attached.
 
 ### Tiered review
 
@@ -45,67 +55,68 @@ Inspired by [pi-auto-reviewer](https://github.com/vinzenzu/pi-auto-reviewer):
   DENY, or ASK. Commands with pipes, redirects, command substitution, or
   secret-looking env vars are always sent to the reviewer.
 
+By default tier 3 reviews **every** evaluation that reaches it, including
+actions OpenCode's rules would silently allow (only explicit configured
+`deny` rules skip hooks entirely). Set `"review": "prompts"` to only review
+evaluations whose computed effect is already `ask` — the original,
+lower-cost behavior.
+
 ### Failure handling
 
 - Retries up to 3 times with a 1-second delay between attempts (handles
   startup races where model connections aren't ready yet).
-- On all failures, the permission request stays pending → the user decides.
-
-## Install
-
-```sh
-bun install
-```
+- On all failures, the hook escalates to `ask` with a failure note → the user
+  decides.
 
 ## Configure
 
-Add to your project's `opencode.jsonc`:
+Add the published package to your `opencode.jsonc`:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "./src/index.ts",
+      "package": "@mellena1/opencode-auto-mode",
       "options": {
         "model": { "id": "deepseek-v4-flash", "providerID": "opencode-go" }
       }
     }
-  ],
-  "permissions": [
-    { "action": "shell", "resource": "*", "effect": "ask" }
   ]
 }
 ```
 
 - **`model`** — the cheap LLM used for tier-3 review. Omit to use your
   location's default model.
-- **`permissions`** — force `ask` for tools you want the plugin to review.
-  Without this, OpenCode's built-in permission rules apply and the plugin
-  may never see a `permission.asked` event.
+- **`review`** — `"all"` (default) reviews every permission evaluation that
+  reaches tier 3, even ones OpenCode would silently allow. `"prompts"`
+  reviews only evaluations that would prompt you anyway.
+
+You no longer need `permissions` rules like
+`{ "action": "shell", "resource": "*", "effect": "ask" }` for the plugin to
+see requests — the evaluate hook runs for allowed decisions too. Keep such a
+rule if you want shell prompts as a fallback when the plugin is disabled.
 
 ## TUI status indicator
 
 The same package ships a TUI plugin (`./tui` entrypoint, `src/tui.tsx`) that
-shows what auto-mode is doing while you work:
+shows what auto-mode is doing while you work. It loads automatically with the
+server plugin (`tui: true`) — no separate registration needed:
 
 - A small badge in the top-right corner of the screen (above dialogs):
   spinner while the reviewer LLM is thinking, `⚠ needs your approval` when
-  it escalates to you. The badge tracks the host's own permission store, so
-  it clears as soon as the permission is answered — no toasts, no footer
-  clutter.
+  it escalates to you. The badge clears as soon as the permission is answered.
 - `allow` / `deny` commands (command palette + keybindings) so you can
-  answer a pending permission yourself at any time.
+  answer an escalated permission yourself at any time.
 
-The TUI plugin is loaded via `cli.json` (the runtime discovers project
-`.opencode/plugins/tui/` files too, but `cli.json` is the reliable global
-path):
+If you prefer to load it explicitly (e.g. CLI-only usage against a remote
+server), register it in `cli.json`:
 
 ```jsonc
 // ~/.config/opencode/cli.json
 {
   "plugins": [
-    { "package": "@mellena1/opencode-auto-mode@0.3.0", "options": {} }
+    { "package": "@mellena1/opencode-auto-mode", "options": {} }
   ]
 }
 ```
@@ -127,11 +138,11 @@ For local development, point the package field at the local checkout:
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Server plugin (Effect API): subscribes to `permission.asked` events, classifies commands, calls the LLM reviewer, and replies to the permission request via the OpenCode HTTP API. Long-running work is forked into the plugin's scope so activation completes promptly |
-| `src/tui.tsx` | TUI plugin: shows review-in-progress / allow-deny status in a top-right badge (driven by the host's permission store), plus manual allow/deny commands and keybindings |
-| `src/client.ts` | Builds an authenticated OpenCode HTTP client by reading the server's registration file — used for `permission.reply` and `generate.text` (not exposed on the plugin `ctx`) |
+| `src/index.ts` | Server plugin: registers a `permission.evaluate` hook, classifies evaluations into tiers, calls the LLM reviewer via the plugin context's `generate.text`, and sets the hook's `effect`/`message` outcome |
+| `src/tui.tsx` | TUI plugin: shows review-in-progress / needs-approval status in a top-right badge, plus manual allow/deny commands and keybindings |
 | `src/tiers.ts` | Command classification: auto-allow, auto-deny, or defer to LLM review |
 | `src/reviewer.ts` | Builds the review prompt for the LLM and parses ALLOW/DENY/ASK decisions |
+| `src/state.ts` | Decision records written to `/tmp` — the channel that feeds the TUI badge during review (outside the project to avoid config-reload loops) |
 | `src/logger.ts` | File logger that writes to `/tmp` — must stay outside the project to avoid triggering an infinite config reload loop |
 
 ## Logs
@@ -142,18 +153,36 @@ tail -f /tmp/opencode-auto-mode/events.log
 
 ## Limitations
 
-- **Self-client**: the server plugin builds its own HTTP client to call
-  `permission.reply` and `generate.text` since the plugin `ctx` does not
-  expose these methods.
-- **Log path**: logs are written to `/tmp/opencode-auto-mode/` to avoid
-  triggering config reload loops. Writing inside `.opencode/` or the
-  project root causes the server to detect a file change and reload the
-  plugin in an infinite loop.
-- **No reason in the result UI**: the `permission.replied` event carries
-  the reply type but not the reviewer's reason message, so the badge shows
-  only the state (reviewing / needs your approval), never the LLM's
-  explanation.
-- **Sticky host permission dialog (17444)**: on some `next` builds the
-  host's permission dialog does not dismiss itself when a permission is
-  answered by a plugin — the dialog stays until answered manually. This is
-  a host bug; upgrading OpenCode fixes it.
+- **Review latency on allowed actions**: by default tier 3 reviews every
+  evaluation, including ones OpenCode would have allowed silently — expect a
+  reviewer round-trip on those. Use `"review": "prompts"` for the old
+  lower-cost scope.
+- **Log path**: logs and decision records are written under
+  `/tmp/opencode-auto-mode/` to avoid triggering config reload loops.
+  Writing inside `.opencode/` or the project root causes the server to
+  detect a file change and reload the plugin in an infinite loop.
+
+## Development
+
+```sh
+bun install
+bun run typecheck
+```
+
+To test local changes, register the checkout directly in your global config:
+
+```jsonc
+// ~/.config/opencode/opencode.jsonc
+{
+  "plugins": [
+    {
+      "package": "/path/to/opencode-auto-mode/src/index.ts",
+      "options": { "model": { "id": "...", "providerID": "..." } }
+    }
+  ]
+}
+```
+
+The plugin tracks the published docs at
+<https://opencode.ai/v2/docs/build/plugins> and
+<https://opencode.ai/v2/docs/build/plugins/cli>.

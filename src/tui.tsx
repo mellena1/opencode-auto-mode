@@ -6,10 +6,9 @@ import type { ResolvedTheme } from "@opencode-ai/theme/tui";
 import { readDecisions } from "./state.js";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const REVIEW_MS = 30_000;
 const MAX_RESOURCE = 48;
 const POLL_MS = 1_000;
-const STALE_MS = REVIEW_MS + 60_000;
+const STALE_MS = 90_000;
 
 type Reply = "once" | "reject";
 
@@ -33,8 +32,11 @@ function truncate(value: string, max: number): string {
 // `ctx.data.session.list()` is unreliable across betas: on 0.0.0-beta-17823
 // the host's session store memo never invalidates, so iterating sessions to
 // find pending permissions sees an empty list forever. Instead the badge is
-// fed by permission events directly, and reconciled against the server
-// plugin's decision file so missed events self-heal within a second.
+// fed by permission events plus the server plugin's decision file: tier-3
+// reviews run inside the evaluate hook BEFORE a permission request exists,
+// so "reviewing" records (synthetic IDs) create spinner entries, and the
+// permission.asked event that follows an escalation adopts the matching
+// entry so its spinner time carries over.
 function Badge(props: {
   pending: () => Pending | undefined;
   answer: (reply: "once" | "reject") => Promise<void>;
@@ -54,7 +56,9 @@ function Badge(props: {
         group: "Auto-mode",
         palette: true,
         bind: props.allowKey,
-        enabled: () => props.pending() !== undefined,
+        // Only real, escalated requests can be answered — during review no
+        // server-side permission request exists yet.
+        enabled: () => props.pending()?.escalated === true,
         run: () => {
           void props.answer("once");
         },
@@ -65,7 +69,7 @@ function Badge(props: {
         group: "Auto-mode",
         palette: true,
         bind: props.denyKey,
-        enabled: () => props.pending() !== undefined,
+        enabled: () => props.pending()?.escalated === true,
         run: () => {
           void props.answer("reject");
         },
@@ -75,8 +79,7 @@ function Badge(props: {
 
   const thinking = createMemo(() => {
     const p = props.pending();
-    if (!p || p.escalated) return false;
-    return Date.now() - p.at < REVIEW_MS;
+    return p !== undefined && !p.escalated;
   });
   const label = createMemo(() => (thinking() ? "reviewing" : "needs your approval"));
 
@@ -118,6 +121,22 @@ export default Plugin.define({
       resources: readonly string[];
     }) => {
       if (pending().some((p) => p.requestID === data.id)) return;
+      // An asked event means the server plugin's review already finished with
+      // ASK. Adopt a matching in-review entry so its spinner duration carries
+      // over instead of restarting the badge from scratch.
+      const inReview = pending().find(
+        (p) => !p.escalated && p.sessionID === data.sessionID && p.action === data.action,
+      );
+      if (inReview) {
+        firstSeen.delete(inReview.requestID);
+        setPending((prev) =>
+          prev.map((p) =>
+            p === inReview ? { ...p, requestID: data.id, escalated: true } : p,
+          ),
+        );
+        firstSeen.set(data.id, inReview.at);
+        return;
+      }
       const at = firstSeen.get(data.id) ?? Date.now();
       firstSeen.set(data.id, at);
       setPending((prev) => [
@@ -128,7 +147,7 @@ export default Plugin.define({
           action: data.action,
           resource: truncate(data.resources.join(" ") || data.action, MAX_RESOURCE),
           at,
-          escalated: false,
+          escalated: true,
         },
       ]);
     };
@@ -164,33 +183,60 @@ export default Plugin.define({
     };
     void runStream();
 
-    // Reconcile with the server plugin's recorded decisions: escalate on
-    // "ask", drop requests it resolved even when a reply event was missed,
-    // and prune requests that outlived the review window unanswered.
+    // Reconcile with the server plugin's decision file:
+    // - "reviewing" records create spinner entries (they precede any event,
+    //   since the evaluate hook runs before the request is published)
+    // - "ask" escalates the entry, "allow"/"deny" resolves it
+    // - entries that outlived every record and the review window are pruned
     const poll = setInterval(() => {
       const decisions = readDecisions();
       const now = Date.now();
+      let next = pending();
       let dirty = false;
-      const next: Pending[] = [];
-      for (const p of pending()) {
+
+      for (const [reviewID, rec] of Object.entries(decisions)) {
+        if (rec.decision !== "reviewing") continue;
+        if (next.some((p) => p.requestID === reviewID)) continue;
+        if (now - rec.at >= STALE_MS) continue;
+        firstSeen.set(reviewID, rec.at);
+        next = [
+          ...next,
+          {
+            requestID: reviewID,
+            sessionID: rec.sessionID,
+            action: rec.action ?? "",
+            resource: truncate(
+              (rec.resources ?? []).join(" ") || rec.action || "",
+              MAX_RESOURCE,
+            ),
+            at: rec.at,
+            escalated: false,
+          },
+        ];
+        dirty = true;
+      }
+
+      const reconciled: Pending[] = [];
+      for (const p of next) {
         const record = decisions[p.requestID];
-        if (record) {
-          if (record.decision === "allow" || record.decision === "deny") {
-            dirty = true;
-            continue;
-          }
-          if (record.decision === "ask" && !p.escalated) {
-            next.push({ ...p, escalated: true });
-            dirty = true;
-            continue;
-          }
-        } else if (now - p.at >= STALE_MS) {
+        if (record?.decision === "allow" || record?.decision === "deny") {
+          firstSeen.delete(p.requestID);
           dirty = true;
           continue;
         }
-        next.push(p);
+        if (record?.decision === "ask" && !p.escalated) {
+          reconciled.push({ ...p, escalated: true });
+          dirty = true;
+          continue;
+        }
+        if (!record && now - p.at >= STALE_MS) {
+          firstSeen.delete(p.requestID);
+          dirty = true;
+          continue;
+        }
+        reconciled.push(p);
       }
-      if (dirty) setPending(next);
+      if (dirty) setPending(reconciled);
     }, POLL_MS);
 
     const mostRecent = createMemo(() => {

@@ -1,7 +1,5 @@
-import { Plugin } from "@opencode-ai/plugin/effect";
-import { Effect, Stream } from "effect";
+import { Plugin } from "@opencode-ai/plugin";
 import { createLogger } from "./logger.js";
-import { makeClient } from "./client.js";
 import { classify } from "./tiers.js";
 import { recordDecision } from "./state.js";
 import {
@@ -12,271 +10,215 @@ import {
 
 const REVIEW_TIMEOUT_MS = 30_000;
 const MAX_REVIEW_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 1_000;
 
-type ReviewerModel = { id: string; providerID: string } | undefined;
+type ReviewerModel = { id: string; providerID: string; variant?: string };
 
-// Module-level claim: the beta host loads one copy of the plugin per active
+// Module-level claim: the host loads one copy of the plugin per active
 // config location (global config location + project location), but every copy
 // shares this module instance (same entrypoint specifier). Only the first
-// copy to activate does the work; the rest exit immediately, so each
-// permission request is reviewed exactly once per process. The claim resets
-// when the claiming copy unloads, so a later location boot can take over.
+// copy to activate registers the evaluate hook; the rest exit immediately, so
+// each permission evaluation is reviewed exactly once per process. The claim
+// resets when the claiming copy unloads, so a later location boot can take over.
 let claimed = false;
-
-/** The payload of a `permission.asked` event. */
-type Asked = {
-  id: string;
-  sessionID: string;
-  action: string;
-  resources: readonly string[];
-  save?: readonly string[];
-  metadata?: Record<string, unknown>;
-  source?: { type: string; messageID: string; id: string };
-};
+let reviewCounter = 0;
 
 export default Plugin.define({
   id: "opencode-auto-mode",
-  effect: (ctx) =>
-    Effect.gen(function* () {
-      const log = createLogger("events.log");
-      if (claimed) {
-        log.log("=== skipping duplicate instance (already claimed) ===");
+  // Ship the TUI badge (./tui entrypoint) alongside the server plugin and
+  // have hosts load it automatically.
+  tui: true,
+  setup: async (ctx) => {
+    const log = createLogger("events.log");
+    if (claimed) {
+      log.log("=== skipping duplicate instance (already claimed) ===");
+      return;
+    }
+    claimed = true;
+    log.log("=== plugin loaded (permission.evaluate hook) ===");
+
+    const options = ctx.options as {
+      model?: ReviewerModel;
+      review?: "all" | "prompts";
+    };
+    const reviewerModel = options.model;
+    // "all" (default): LLM-review every evaluation that reaches tier 3, even
+    // ones OpenCode's rules would silently allow. "prompts": only review
+    // evaluations whose computed effect is already "ask" — the original,
+    // lower-cost behavior.
+    const reviewScope = options.review === "prompts" ? "prompts" : "all";
+
+    const registration = await ctx.permission.hook("evaluate", async (event) => {
+      const classification = classify(event.action, event.resources);
+      log.logJSON("classification", { ...classification, effect: event.effect });
+
+      // Tier 2: Auto-deny — catastrophic commands blocked immediately. Runs
+      // before the deny guard below so an incoming deny is re-affirmed.
+      if (classification.tier === "auto-deny") {
+        event.effect = "deny";
+        event.message = `auto-denied: ${classification.reason}`;
         return;
       }
-      claimed = true;
-      log.log("=== plugin loaded ===");
 
-      // Runs when the plugin's scope closes — on reload or unload, even
-      // when the plugin is interrupted mid-flight.
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          claimed = false;
-          log.log("=== plugin unloaded ===");
-        }),
-      );
+      // Respect denials that already exist. Explicitly configured denies
+      // never reach this hook; anything else with a deny effect stays denied.
+      if (event.effect === "deny") return;
 
-      const client = yield* Effect.tryPromise({
-        try: () => makeClient(),
-        catch: (err) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          log.log(`FATAL: could not create client: ${msg}`);
-          // Throwing in the mapper turns this into a defect, which kills the
-          // plugin without touching the effect's error channel (E must be
-          // never for the plugin effect).
-          throw err instanceof Error ? err : new Error(msg);
-        },
-      });
-      log.log("client created");
+      // Tier 1: Auto-allow — safe read-only commands skip the LLM entirely.
+      if (classification.tier === "auto-allow") {
+        event.effect = "allow";
+        event.message = `auto-approved: ${classification.reason}`;
+        return;
+      }
 
-      const reviewerModel = ctx.options.model as ReviewerModel;
+      // Tier 3: LLM review. In "prompts" scope, only evaluations that would
+      // prompt the user anyway get reviewed.
+      if (reviewScope === "prompts" && event.effect !== "ask") return;
 
-      // The plugin effect must COMPLETE for activation to finish — the
-      // supervisor awaits it, and /api/model waits on plugins.flush with a
-      // 5s timeout (503 "Model catalog initialization timed out"). Long-lived
-      // work is forked into the plugin's scope instead: the supervisor holds
-      // the scope open until reload/unload, which interrupts the fork and
-      // releases the bus subscription.
-      yield* (
-        ctx.event
-          .subscribe()
-          .pipe(
-            // The stream carries an error channel; log and end instead of
-            // failing the plugin effect (its error channel must stay never).
-            Stream.catch((err) => {
-              log.log(`event stream error: ${err instanceof Error ? err.message : String(err)}`);
-              return Stream.empty;
-            }),
-            Stream.filter(
-              (event): event is Extract<typeof event, { type: "permission.asked" }> =>
-                event.type === "permission.asked",
-            ),
-            Stream.runForEach((event) => {
-              // Reviews run concurrently on their own scoped fibers.
-              const review = reviewAndReply(client, event.data, reviewerModel, log) as Effect.Effect<void, never, never>;
-              return Effect.forkScoped(review).pipe(Effect.asVoid);
-            }),
-          ) as Effect.Effect<void, never, never>
-      ).pipe(Effect.forkScoped(), Effect.asVoid);
-    }),
-});
-
-function reviewAndReply(
-  client: Awaited<ReturnType<typeof makeClient>>,
-  data: Asked,
-  reviewerModel: ReviewerModel,
-  log: ReturnType<typeof createLogger>,
-): Effect.Effect<void> {
-  const req = toPermissionRequest(data);
-  return Effect.gen(function* () {
-    const classification = classify(req.action, req.resources);
-    log.logJSON("classification", classification);
-
-    // Tier 1: Auto-allow — safe commands skip the LLM entirely
-    if (classification.tier === "auto-allow") {
-      recordDecision({
-        requestID: req.id,
-        sessionID: req.sessionID,
-        decision: "allow",
-        reason: classification.reason,
-        at: Date.now(),
-      });
-      yield* reply(
-        client,
-        req,
-        "once",
-        `auto-allowed: ${classification.reason}`,
-        log,
-        `auto-allow: ${classification.reason}`,
-      );
-      return;
-    }
-
-    // Tier 2: Auto-deny — dangerous commands blocked immediately
-    if (classification.tier === "auto-deny") {
-      recordDecision({
-        requestID: req.id,
-        sessionID: req.sessionID,
-        decision: "deny",
-        reason: classification.reason,
-        at: Date.now(),
-      });
-      yield* reply(
-        client,
-        req,
-        "reject",
-        `auto-denied: ${classification.reason}`,
-        log,
-        `auto-deny: ${classification.reason}`,
-      );
-      return;
-    }
-
-    // Tier 3: LLM review needed
-    yield* reviewWithLLM(client, req, reviewerModel, log);
-  });
-}
-
-function reviewWithLLM(
-  client: Awaited<ReturnType<typeof makeClient>>,
-  req: PermissionRequest,
-  reviewerModel: ReviewerModel,
-  log: ReturnType<typeof createLogger>,
-): Effect.Effect<void> {
-  return Effect.gen(function* () {
-    log.log("reviewing...");
-
-    const result = yield* attemptReview(client, req, reviewerModel, log);
-    if (result === undefined) return; // all attempts failed — logged and recorded above
-
-    log.logJSON("reviewer response", result);
-
-    const { decision, reason } = parseDecision(result.text);
-    log.log(`decision: ${decision} — ${reason}`);
-
-    recordDecision({
-      requestID: req.id,
-      sessionID: req.sessionID,
-      decision,
-      reason,
-      at: Date.now(),
+      await reviewWithLLM(ctx, event, reviewerModel, log);
     });
 
-    if (decision === "allow") {
-      yield* reply(client, req, "once", reason, log, "replied: once (allow)");
-      return;
-    }
+    // Runs when the plugin unloads or reloads.
+    return () => {
+      claimed = false;
+      void registration.dispose();
+      log.log("=== plugin unloaded ===");
+    };
+  },
+});
 
-    if (decision === "deny") {
-      yield* reply(client, req, "reject", reason, log, "replied: reject (deny)");
-      return;
-    }
+// Structural subset of the SDK's PermissionEvaluation used by the helpers
+// below. The inline hook registration above is typed by the SDK directly.
+interface Evaluation {
+  readonly sessionID: string;
+  readonly agent?: string;
+  readonly action: string;
+  readonly resources: readonly string[];
+  effect: "allow" | "deny" | "ask";
+  message?: string;
+}
 
-    // ASK: don't reply, let the user decide
-    log.log("no reply — falling back to user");
+async function reviewWithLLM(
+  ctx: { generate: { text(input: { prompt: string; model?: ReviewerModel | null }): Promise<{ text: string }> } },
+  event: Evaluation,
+  reviewerModel: ReviewerModel | undefined,
+  log: ReturnType<typeof createLogger>,
+): Promise<void> {
+  log.log("reviewing...");
+
+  // No real request ID exists yet (the prompt is only published after the
+  // hook returns), so decision records use a synthetic ID. The TUI badge
+  // keys off these records to show review progress.
+  const reviewID = `review-${Date.now()}-${reviewCounter++}`;
+  recordDecision({
+    requestID: reviewID,
+    sessionID: event.sessionID,
+    decision: "reviewing",
+    reason: "",
+    at: Date.now(),
+    action: event.action,
+    resources: [...event.resources],
   });
-}
 
-function attemptReview(
-  client: Awaited<ReturnType<typeof makeClient>>,
-  req: PermissionRequest,
-  reviewerModel: ReviewerModel,
-  log: ReturnType<typeof createLogger>,
-): Effect.Effect<{ text: string } | undefined> {
-  const attempt = Effect.tryPromise({
-    try: () =>
-      client.generate.text({
-        prompt: buildReviewPrompt(req),
-        model: reviewerModel ?? null,
-      }),
-    catch: (err) => err,
-  }).pipe(Effect.timeout(REVIEW_TIMEOUT_MS));
-
-  return attempt.pipe(
-    Effect.retry({
-      times: MAX_REVIEW_ATTEMPTS - 1,
-      delay: "1 seconds",
-      while: (error) => !isPermissionNotFound(error),
-    }),
-    Effect.catch((error) => {
-      const msg = error instanceof Error ? error.message : JSON.stringify(error);
-      log.log(`all review attempts failed: ${msg} — falling back to user`);
-      recordDecision({
-        requestID: req.id,
-        sessionID: req.sessionID,
-        decision: "ask",
-        reason: `review failed: ${msg}`,
-        at: Date.now(),
-      });
-      return Effect.succeed(undefined);
-    }),
-  );
-}
-
-function reply(
-  client: Awaited<ReturnType<typeof makeClient>>,
-  req: PermissionRequest,
-  replyType: "once" | "reject",
-  message: string,
-  log: ReturnType<typeof createLogger>,
-  successLog: string,
-): Effect.Effect<void> {
-  return Effect.tryPromise({
-    try: () =>
-      client.permission.reply({
-        sessionID: req.sessionID,
-        requestID: req.id,
-        reply: replyType,
-        message,
-      }),
-    catch: (err) => err,
-  }).pipe(
-    Effect.tap(() => Effect.sync(() => log.log(successLog))),
-    Effect.catch((err) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.log(`reply failed: ${msg}`);
-      return Effect.void;
-    }),
-  );
-}
-
-function toPermissionRequest(data: Asked): PermissionRequest {
-  return {
-    id: data.id,
-    sessionID: data.sessionID,
-    action: data.action,
-    resources: [...data.resources],
-    save: data.save ? [...data.save] : undefined,
-    source: data.source
-      ? { type: data.source.type, messageID: data.source.messageID, callID: data.source.id }
-      : undefined,
+  const req: PermissionRequest = {
+    action: event.action,
+    resources: [...event.resources],
+    agent: event.agent,
   };
+
+  const result = await attemptReview(ctx, req, reviewerModel, log);
+  if (!result) {
+    // All attempts failed — fall back to the user rather than blocking
+    // forever or silently letting the original decision stand.
+    const failReason = "auto-mode reviewer failed — please decide yourself";
+    log.log(`escalating to user: ${failReason}`);
+    recordDecision({
+      requestID: reviewID,
+      sessionID: event.sessionID,
+      decision: "ask",
+      reason: failReason,
+      at: Date.now(),
+    });
+    event.effect = "ask";
+    event.message = failReason;
+    return;
+  }
+
+  log.logJSON("reviewer response", result);
+
+  const { decision, reason } = parseDecision(result.text);
+  log.log(`decision: ${decision} — ${reason}`);
+
+  recordDecision({
+    requestID: reviewID,
+    sessionID: event.sessionID,
+    decision,
+    reason,
+    at: Date.now(),
+  });
+
+  if (decision === "allow") {
+    event.effect = "allow";
+    event.message = reason;
+    return;
+  }
+
+  if (decision === "deny") {
+    event.effect = "deny";
+    event.message = reason;
+    return;
+  }
+
+  // ASK: escalate to the user. The message is included in the published
+  // permission request, so the reviewer's explanation shows in the dialog.
+  event.effect = "ask";
+  event.message = reason;
 }
 
-function isPermissionNotFound(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "_tag" in error &&
-    (error as Record<string, unknown>)._tag === "PermissionNotFoundError"
-  );
+async function attemptReview(
+  ctx: { generate: { text(input: { prompt: string; model?: ReviewerModel | null }): Promise<{ text: string }> } },
+  req: PermissionRequest,
+  reviewerModel: ReviewerModel | undefined,
+  log: ReturnType<typeof createLogger>,
+): Promise<{ text: string } | undefined> {
+  for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt++) {
+    try {
+      return await withTimeout(
+        ctx.generate.text({
+          prompt: buildReviewPrompt(req),
+          model: reviewerModel ?? null,
+        }),
+        REVIEW_TIMEOUT_MS,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.log(`review attempt ${attempt}/${MAX_REVIEW_ATTEMPTS} failed: ${msg}`);
+      if (attempt < MAX_REVIEW_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      }
+    }
+  }
+
+  // All attempts failed — fall back to the user rather than blocking forever.
+  log.log("all review attempts failed — falling back to user");
+  return undefined;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`review timed out after ${ms}ms`)),
+      ms,
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
