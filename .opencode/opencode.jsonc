@@ -12,7 +12,32 @@
   //     }
   //   }
   // ],
+  // Mirror the global allow-list: a project .opencode config overrides
+  // every direct/global config, so without these the catch-all below would
+  // shadow the global rules and force LLM review of everything here.
   "permissions": [
+    { "action": "edit", "resource": "*", "effect": "allow" },
+    { "action": "shell", "resource": "ls*", "effect": "allow" },
+    { "action": "shell", "resource": "find*", "effect": "allow" },
+    { "action": "shell", "resource": "mkdir*", "effect": "allow" },
+    { "action": "shell", "resource": "cat*", "effect": "allow" },
+    { "action": "shell", "resource": "pwd", "effect": "allow" },
+    { "action": "shell", "resource": "echo*", "effect": "allow" },
+    { "action": "shell", "resource": "head*", "effect": "allow" },
+    { "action": "shell", "resource": "tail*", "effect": "allow" },
+    { "action": "shell", "resource": "grep*", "effect": "allow" },
+    { "action": "shell", "resource": "rg*", "effect": "allow" },
+    { "action": "shell", "resource": "git status*", "effect": "allow" },
+    { "action": "shell", "resource": "git diff*", "effect": "allow" },
+    { "action": "shell", "resource": "git log*", "effect": "allow" },
+    { "action": "shell", "resource": "git show*", "effect": "allow" },
+    { "action": "shell", "resource": "which*", "effect": "allow" },
+    { "action": "shell", "resource": "cd *", "effect": "allow" },
+    { "action": "shell", "resource": "wc*", "effect": "allow" },
+    { "action": "shell", "resource": "sort*", "effect": "allow" },
+    { "action": "shell", "resource": "uniq*", "effect": "allow" },
+    { "action": "shell", "resource": "diff*", "effect": "allow" },
+    { "action": "shell", "resource": "file*", "effect": "allow" },
     { "action": "shell", "resource": "*", "effect": "ask" }
   ]
 }
