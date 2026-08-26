@@ -14,13 +14,10 @@ const RETRY_DELAY_MS = 1_000;
 
 type ReviewerModel = { id: string; providerID: string; variant?: string };
 
-// Module-level claim: the host loads one copy of the plugin per active
-// config location (global config location + project location), but every copy
-// shares this module instance (same entrypoint specifier). Only the first
-// copy to activate registers the evaluate hook; the rest exit immediately, so
-// each permission evaluation is reviewed exactly once per process. The claim
-// resets when the claiming copy unloads, so a later location boot can take over.
-let claimed = false;
+// NOTE: deliberately no cross-copy claim here. The host loads one plugin
+// copy per config location, and permission.evaluate hooks are consulted
+// per-location — so every copy must register its own hook. A module-level
+// claim makes hook delivery depend on which location happens to boot first.
 let reviewCounter = 0;
 
 export default Plugin.define({
@@ -30,11 +27,6 @@ export default Plugin.define({
   tui: true,
   setup: async (ctx) => {
     const log = createLogger("events.log");
-    if (claimed) {
-      log.log("=== skipping duplicate instance (already claimed) ===");
-      return;
-    }
-    claimed = true;
     log.log("=== plugin loaded (permission.evaluate hook) ===");
 
     const options = ctx.options as {
@@ -49,43 +41,59 @@ export default Plugin.define({
     const reviewScope = options.review === "prompts" ? "prompts" : "all";
 
     const registration = await ctx.permission.hook("evaluate", async (event) => {
-      const classification = classify(event.action, event.resources);
-      log.logJSON("classification", { ...classification, effect: event.effect });
-
-      // Tier 2: Auto-deny — catastrophic commands blocked immediately. Runs
-      // before the deny guard below so an incoming deny is re-affirmed.
-      if (classification.tier === "auto-deny") {
-        event.effect = "deny";
-        event.message = `auto-denied: ${classification.reason}`;
-        return;
+      try {
+        await evaluate(ctx, event, reviewerModel, reviewScope, log);
+      } catch (err) {
+        // The host swallows hook errors silently; log so failures are
+        // diagnosable via events.log.
+        log.logJSON("hook error", { error: String(err) });
+        throw err;
       }
-
-      // Respect denials that already exist. Explicitly configured denies
-      // never reach this hook; anything else with a deny effect stays denied.
-      if (event.effect === "deny") return;
-
-      // Tier 1: Auto-allow — safe read-only commands skip the LLM entirely.
-      if (classification.tier === "auto-allow") {
-        event.effect = "allow";
-        event.message = `auto-approved: ${classification.reason}`;
-        return;
-      }
-
-      // Tier 3: LLM review. In "prompts" scope, only evaluations that would
-      // prompt the user anyway get reviewed.
-      if (reviewScope === "prompts" && event.effect !== "ask") return;
-
-      await reviewWithLLM(ctx, event, reviewerModel, log);
     });
 
     // Runs when the plugin unloads or reloads.
     return () => {
-      claimed = false;
       void registration.dispose();
       log.log("=== plugin unloaded ===");
     };
   },
 });
+
+async function evaluate(
+  ctx: { generate: { text(input: { prompt: string; model?: ReviewerModel | null }): Promise<{ text: string }> } },
+  event: Evaluation,
+  reviewerModel: ReviewerModel | undefined,
+  reviewScope: "all" | "prompts",
+  log: ReturnType<typeof createLogger>,
+): Promise<void> {
+  const classification = classify(event.action, event.resources);
+  log.logJSON("classification", { ...classification, effect: event.effect });
+
+  // Tier 2: Auto-deny — catastrophic commands blocked immediately. Runs
+  // before the deny guard below so an incoming deny is re-affirmed.
+  if (classification.tier === "auto-deny") {
+    event.effect = "deny";
+    event.message = `auto-denied: ${classification.reason}`;
+    return;
+  }
+
+  // Respect denials that already exist. Explicitly configured denies
+  // never reach this hook; anything else with a deny effect stays denied.
+  if (event.effect === "deny") return;
+
+  // Tier 1: Auto-allow — safe read-only commands skip the LLM entirely.
+  if (classification.tier === "auto-allow") {
+    event.effect = "allow";
+    event.message = `auto-approved: ${classification.reason}`;
+    return;
+  }
+
+  // Tier 3: LLM review. In "prompts" scope, only evaluations that would
+  // prompt the user anyway get reviewed.
+  if (reviewScope === "prompts" && event.effect !== "ask") return;
+
+  await reviewWithLLM(ctx, event, reviewerModel, log);
+}
 
 // Structural subset of the SDK's PermissionEvaluation used by the helpers
 // below. The inline hook registration above is typed by the SDK directly.
