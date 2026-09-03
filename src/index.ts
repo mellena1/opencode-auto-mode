@@ -22,9 +22,8 @@ let reviewCounter = 0;
 
 export default Plugin.define({
   id: "opencode-auto-mode",
-  // Ship the TUI badge (./tui entrypoint) alongside the server plugin and
-  // have hosts load it automatically.
-  tui: true,
+  // The TUI badge (./tui entrypoint) ships alongside the server plugin and
+  // hosts load it automatically via the "./tui" export in package.json.
   setup: async (ctx) => {
     const log = createLogger("events.log");
     log.log("=== plugin loaded (permission.evaluate hook) ===");
@@ -60,7 +59,7 @@ export default Plugin.define({
 });
 
 async function evaluate(
-  ctx: { generate: { text(input: { prompt: string; model?: ReviewerModel | null }): Promise<{ text: string }> } },
+  ctx: GenerateContext,
   event: Evaluation,
   reviewerModel: ReviewerModel | undefined,
   reviewScope: "all" | "prompts",
@@ -106,8 +105,21 @@ interface Evaluation {
   message?: string;
 }
 
+// Structural subset of the plugin context's generate API. The second
+// requestOptions argument carries per-request headers — used to forward the
+// originating session so OpenCode Go / Zen can optimize prompt caching via
+// the x-opencode-session header.
+type GenerateContext = {
+  generate: {
+    text(
+      input: { prompt: string; model?: ReviewerModel | null },
+      requestOptions?: { headers?: Record<string, string>; signal?: AbortSignal },
+    ): Promise<{ text: string }>;
+  };
+};
+
 async function reviewWithLLM(
-  ctx: { generate: { text(input: { prompt: string; model?: ReviewerModel | null }): Promise<{ text: string }> } },
+  ctx: GenerateContext,
   event: Evaluation,
   reviewerModel: ReviewerModel | undefined,
   log: ReturnType<typeof createLogger>,
@@ -134,7 +146,7 @@ async function reviewWithLLM(
     agent: event.agent,
   };
 
-  const result = await attemptReview(ctx, req, reviewerModel, log);
+  const result = await attemptReview(ctx, req, event.sessionID, reviewerModel, log);
   if (!result) {
     // All attempts failed — fall back to the user rather than blocking
     // forever or silently letting the original decision stand.
@@ -184,18 +196,25 @@ async function reviewWithLLM(
 }
 
 async function attemptReview(
-  ctx: { generate: { text(input: { prompt: string; model?: ReviewerModel | null }): Promise<{ text: string }> } },
+  ctx: GenerateContext,
   req: PermissionRequest,
+  sessionID: string,
   reviewerModel: ReviewerModel | undefined,
   log: ReturnType<typeof createLogger>,
 ): Promise<{ text: string } | undefined> {
   for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt++) {
     try {
       return await withTimeout(
-        ctx.generate.text({
-          prompt: buildReviewPrompt(req),
-          model: reviewerModel ?? null,
-        }),
+        ctx.generate.text(
+          {
+            prompt: buildReviewPrompt(req),
+            model: reviewerModel ?? null,
+          },
+          // Identify the originating session so OpenCode Go / Zen can route
+          // requests from the same session to the same provider and optimize
+          // prompt caching.
+          { headers: { "x-opencode-session": sessionID } },
+        ),
         REVIEW_TIMEOUT_MS,
       );
     } catch (err) {
