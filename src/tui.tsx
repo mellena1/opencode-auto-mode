@@ -189,6 +189,7 @@ export default Plugin.define({
     // - "ask" escalates the entry, "allow"/"deny" resolves it
     // - entries that outlived every record and the review window are pruned
     const poll = setInterval(() => {
+      snapshotView();
       const decisions = readDecisions();
       const now = Date.now();
       let next = pending();
@@ -239,8 +240,38 @@ export default Plugin.define({
       if (dirty) setPending(reconciled);
     }, POLL_MS);
 
+    // View scoping: decision records live in a machine-global file (and on
+    // shared servers permission events are global too), so without filtering
+    // every open TUI would badge other TUIs' reviews. Router + tabs state is
+    // client-local — a foreign session is never the current route nor an open
+    // tab here — which discriminates both separate-server and shared-server
+    // setups. Snapshotted on the existing poll tick (1s granularity is fine
+    // for a status badge) instead of relying on host reactivity.
+    const [visibleIDs, setVisibleIDs] = createSignal<ReadonlySet<string>>(new Set());
+    const snapshotView = () => {
+      const ids = new Set<string>();
+      try {
+        if (ctx.ui.tabs.enabled()) {
+          for (const tab of ctx.ui.tabs.list()) ids.add(tab.sessionID);
+        }
+      } catch {
+        // tabs unavailable — route only
+      }
+      try {
+        const route = ctx.ui.router.current();
+        if (route.type === "session") ids.add(route.sessionID);
+      } catch {
+        // router unavailable — tabs only
+      }
+      const key = [...ids].sort().join(",");
+      const prev = [...visibleIDs()].sort().join(",");
+      if (key !== prev) setVisibleIDs(ids);
+    };
+    snapshotView();
+
     const mostRecent = createMemo(() => {
-      const requests = pending();
+      const visible = visibleIDs();
+      const requests = pending().filter((p) => visible.has(p.sessionID));
       return requests.length > 0 ? requests[requests.length - 1] : undefined;
     });
 
@@ -265,8 +296,8 @@ export default Plugin.define({
     };
 
     // Top-right overlay, above the permission dialog (which covers the bottom
-    // bar). Only visible while a permission request is pending: spinner while
-    // reviewing, ⚠ when it needs the user.
+    // bar). Only visible while this TUI has a session with a pending review:
+    // spinner while reviewing, ⚠ when it needs the user.
     const disposeBadge = ctx.ui.slot({
       append: "app",
       render: () => (
