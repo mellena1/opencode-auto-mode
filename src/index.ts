@@ -2,28 +2,34 @@ import { Plugin } from "@opencode-ai/plugin";
 import { createLogger } from "./logger.js";
 import { classify } from "./tiers.js";
 import { recordDecision } from "./state.js";
+import { defaultPolicy, type PolicyOptions, type ReviewPolicy } from "./policy.js";
+import { extractTranscript } from "./transcript.js";
+import { scanResultContent, withInjectionWarning } from "./probe.js";
 import {
-  buildReviewPrompt,
+  buildStage1Prompt,
+  buildStage2Prompt,
   parseDecision,
+  parseStage1,
+  withDenySuffix,
   type PermissionRequest,
 } from "./reviewer.js";
 
 const REVIEW_TIMEOUT_MS = 30_000;
+const CONTEXT_TIMEOUT_MS = 3_000;
 const MAX_REVIEW_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 1_000;
+const MAX_CONSECUTIVE_DENIALS = 3;
+const MAX_TOTAL_DENIALS = 20;
 
 type ReviewerModel = { id: string; providerID: string; variant?: string };
 
-// NOTE: deliberately no cross-copy claim here. The host loads one plugin
-// copy per config location, and permission.evaluate hooks are consulted
-// per-location — so every copy must register its own hook. A module-level
-// claim makes hook delivery depend on which location happens to boot first.
 let reviewCounter = 0;
+
+const denialCounts = new Map<string, { consecutive: number; total: number }>();
+const projectDirCache = new Map<string, string | undefined>();
 
 export default Plugin.define({
   id: "opencode-auto-mode",
-  // The TUI badge (./tui entrypoint) ships alongside the server plugin and
-  // hosts load it automatically via the "./tui" export in package.json.
   setup: async (ctx) => {
     const log = createLogger("events.log");
     log.log("=== plugin loaded (permission.evaluate hook) ===");
@@ -31,71 +37,82 @@ export default Plugin.define({
     const options = ctx.options as {
       model?: ReviewerModel;
       review?: "all" | "prompts";
-    };
+    } & PolicyOptions & { allowInProjectEdits?: boolean };
     const reviewerModel = options.model;
-    // "all" (default): LLM-review every evaluation that reaches tier 3, even
-    // ones OpenCode's rules would silently allow. "prompts": only review
-    // evaluations whose computed effect is already "ask" — the original,
-    // lower-cost behavior.
     const reviewScope = options.review === "prompts" ? "prompts" : "all";
+    const policy = defaultPolicy(options);
+    const allowInProjectEdits = options.allowInProjectEdits !== false;
 
-    const registration = await ctx.permission.hook("evaluate", async (event) => {
+    const permissionRegistration = await ctx.permission.hook("evaluate", async (event) => {
       try {
-        await evaluate(ctx, event, reviewerModel, reviewScope, log);
+        await evaluate(ctx, event, { reviewerModel, reviewScope, policy, allowInProjectEdits }, log);
       } catch (err) {
-        // The host swallows hook errors silently; log so failures are
-        // diagnosable via events.log.
         log.logJSON("hook error", { error: String(err) });
         throw err;
       }
     });
 
-    // Runs when the plugin unloads or reloads.
+    const toolRegistration = await ctx.tool.hook("execute.after", (event) => {
+      try {
+        if (event.status !== "completed") return;
+        const result = event.result as { content?: unknown };
+        if (result?.content === undefined) return;
+        if (scanResultContent(result.content)) {
+          result.content = withInjectionWarning(
+            result.content as string | ReadonlyArray<{ type: string; text?: string }>,
+          ) as typeof result.content;
+          log.logJSON("injection warning added", { sessionID: event.sessionID, tool: event.tool });
+        }
+      } catch (err) {
+        log.logJSON("probe error", { error: String(err) });
+      }
+    });
+
     return () => {
-      void registration.dispose();
+      void permissionRegistration.dispose();
+      void toolRegistration.dispose();
       log.log("=== plugin unloaded ===");
     };
   },
 });
 
+interface EvaluateDeps {
+  reviewerModel: ReviewerModel | undefined;
+  reviewScope: "all" | "prompts";
+  policy: ReviewPolicy;
+  allowInProjectEdits: boolean;
+}
+
 async function evaluate(
-  ctx: GenerateContext,
+  ctx: PluginContext,
   event: Evaluation,
-  reviewerModel: ReviewerModel | undefined,
-  reviewScope: "all" | "prompts",
+  deps: EvaluateDeps,
   log: ReturnType<typeof createLogger>,
 ): Promise<void> {
-  const classification = classify(event.action, event.resources);
+  const projectDir = await projectDirFor(ctx, event.sessionID, log);
+  const classification = classify(event.action, event.resources, {
+    projectDir: deps.allowInProjectEdits ? projectDir : undefined,
+  });
   log.logJSON("classification", { ...classification, effect: event.effect });
 
-  // Tier 2: Auto-deny — catastrophic commands blocked immediately. Runs
-  // before the deny guard below so an incoming deny is re-affirmed.
   if (classification.tier === "auto-deny") {
-    event.effect = "deny";
-    event.message = `auto-denied: ${classification.reason}`;
+    deny(event, classification.reason, log);
     return;
   }
 
-  // Respect denials that already exist. Explicitly configured denies
-  // never reach this hook; anything else with a deny effect stays denied.
   if (event.effect === "deny") return;
 
-  // Tier 1: Auto-allow — safe read-only commands skip the LLM entirely.
   if (classification.tier === "auto-allow") {
     event.effect = "allow";
     event.message = `auto-approved: ${classification.reason}`;
     return;
   }
 
-  // Tier 3: LLM review. In "prompts" scope, only evaluations that would
-  // prompt the user anyway get reviewed.
-  if (reviewScope === "prompts" && event.effect !== "ask") return;
+  if (deps.reviewScope === "prompts" && event.effect !== "ask") return;
 
-  await reviewWithLLM(ctx, event, reviewerModel, log);
+  await reviewWithLLM(ctx, event, deps, projectDir, log);
 }
 
-// Structural subset of the SDK's PermissionEvaluation used by the helpers
-// below. The inline hook registration above is typed by the SDK directly.
 interface Evaluation {
   readonly sessionID: string;
   readonly agent?: string;
@@ -105,30 +122,50 @@ interface Evaluation {
   message?: string;
 }
 
-// Structural subset of the plugin context's generate API. The second
-// requestOptions argument carries per-request headers — used to forward the
-// originating session so OpenCode Go / Zen can optimize prompt caching via
-// the x-opencode-session header.
-type GenerateContext = {
+interface PluginContext {
   generate: {
     text(
       input: { prompt: string; model?: ReviewerModel | null },
       requestOptions?: { headers?: Record<string, string>; signal?: AbortSignal },
     ): Promise<{ text: string }>;
   };
-};
+  session: {
+    get(input: { sessionID: string }): Promise<{ location?: { directory?: string } }>;
+    context(input: { sessionID: string }): Promise<unknown[]>;
+  };
+}
+
+async function projectDirFor(
+  ctx: PluginContext,
+  sessionID: string,
+  log: ReturnType<typeof createLogger>,
+): Promise<string | undefined> {
+  if (projectDirCache.has(sessionID)) return projectDirCache.get(sessionID);
+  try {
+    const info = await withTimeout(ctx.session.get({ sessionID }), CONTEXT_TIMEOUT_MS);
+    const dir = info?.location?.directory;
+    projectDirCache.set(sessionID, dir);
+    return dir;
+  } catch (err) {
+    log.log(`project dir lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+}
+
+async function transcriptFor(ctx: PluginContext, sessionID: string): Promise<string | undefined> {
+  const messages = await withTimeout(ctx.session.context({ sessionID }), CONTEXT_TIMEOUT_MS);
+  return extractTranscript(messages);
+}
 
 async function reviewWithLLM(
-  ctx: GenerateContext,
+  ctx: PluginContext,
   event: Evaluation,
-  reviewerModel: ReviewerModel | undefined,
+  deps: EvaluateDeps,
+  projectDir: string | undefined,
   log: ReturnType<typeof createLogger>,
 ): Promise<void> {
   log.log("reviewing...");
 
-  // No real request ID exists yet (the prompt is only published after the
-  // hook returns), so decision records use a synthetic ID. The TUI badge
-  // keys off these records to show review progress.
   const reviewID = `review-${Date.now()}-${reviewCounter++}`;
   recordDecision({
     requestID: reviewID,
@@ -140,64 +177,135 @@ async function reviewWithLLM(
     resources: [...event.resources],
   });
 
+  let transcript: string | undefined;
+  try {
+    transcript = await transcriptFor(ctx, event.sessionID);
+  } catch (err) {
+    log.log(`transcript lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   const req: PermissionRequest = {
     action: event.action,
     resources: [...event.resources],
     agent: event.agent,
+    projectDir,
+    transcript,
+    isDelegation: event.action === "task" || event.action === "subagent",
   };
 
-  const result = await attemptReview(ctx, req, event.sessionID, reviewerModel, log);
-  if (!result) {
-    // All attempts failed — fall back to the user rather than blocking
-    // forever or silently letting the original decision stand.
-    const failReason = "auto-mode reviewer failed — please decide yourself";
-    log.log(`escalating to user: ${failReason}`);
-    recordDecision({
-      requestID: reviewID,
-      sessionID: event.sessionID,
-      decision: "ask",
-      reason: failReason,
-      at: Date.now(),
-    });
-    event.effect = "ask";
-    event.message = failReason;
+  const stage1 = await attemptReview(
+    ctx,
+    buildStage1Prompt(req, deps.policy),
+    event.sessionID,
+    deps.reviewerModel,
+    log,
+  );
+  if (!stage1) return escalate(event, reviewID, "auto-mode reviewer failed — please decide yourself", log);
+
+  const triage = parseStage1(stage1.text);
+  log.logJSON("stage1 triage", { triage, text: stage1.text.slice(0, 80) });
+  if (triage === "allow") {
+    event.effect = "allow";
+    event.message = "auto-approved: fast-path triage passed";
+    recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision: "allow", reason: event.message, at: Date.now() });
+    noteApproval(event.sessionID);
     return;
   }
+
+  const result = await attemptReview(
+    ctx,
+    buildStage2Prompt(req, deps.policy),
+    event.sessionID,
+    deps.reviewerModel,
+    log,
+  );
+  if (!result) return escalate(event, reviewID, "auto-mode reviewer failed — please decide yourself", log);
 
   log.logJSON("reviewer response", result);
 
   const { decision, reason } = parseDecision(result.text);
   log.log(`decision: ${decision} — ${reason}`);
 
-  recordDecision({
-    requestID: reviewID,
-    sessionID: event.sessionID,
-    decision,
-    reason,
-    at: Date.now(),
-  });
+  recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision, reason, at: Date.now() });
 
   if (decision === "allow") {
     event.effect = "allow";
     event.message = reason;
+    noteApproval(event.sessionID);
     return;
   }
 
   if (decision === "deny") {
-    event.effect = "deny";
-    event.message = reason;
+    const backstop = denialBackstop(event.sessionID);
+    if (backstop) {
+      event.effect = "ask";
+      event.message = backstop;
+      recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision: "ask", reason: backstop, at: Date.now() });
+      return;
+    }
+    deny(event, reason, log);
     return;
   }
 
-  // ASK: escalate to the user. The message is included in the published
-  // permission request, so the reviewer's explanation shows in the dialog.
+  noteApproval(event.sessionID);
   event.effect = "ask";
   event.message = reason;
 }
 
+function deny(event: Evaluation, reason: string, log: ReturnType<typeof createLogger>): void {
+  const counts = denialCounts.get(event.sessionID) ?? { consecutive: 0, total: 0 };
+  counts.consecutive += 1;
+  counts.total += 1;
+  denialCounts.set(event.sessionID, counts);
+  log.logJSON("denial", counts);
+  if (counts.consecutive >= MAX_CONSECUTIVE_DENIALS || counts.total >= MAX_TOTAL_DENIALS) {
+    counts.consecutive = 0;
+    event.effect = "ask";
+    event.message =
+      `auto-mode blocked ${counts.total} actions in this session (backstop) — please decide yourself. Last block: ${reason}`;
+    return;
+  }
+  event.effect = "deny";
+  event.message = withDenySuffix(reason);
+}
+
+function denialBackstop(sessionID: string): string | undefined {
+  const counts = denialCounts.get(sessionID) ?? { consecutive: 0, total: 0 };
+  counts.consecutive += 1;
+  counts.total += 1;
+  denialCounts.set(sessionID, counts);
+  if (counts.consecutive >= MAX_CONSECUTIVE_DENIALS || counts.total >= MAX_TOTAL_DENIALS) {
+    counts.consecutive = 0;
+    denialCounts.set(sessionID, counts);
+    return `auto-mode blocked ${counts.total} actions in this session (backstop) — please decide yourself`;
+  }
+  return undefined;
+}
+
+function noteApproval(sessionID: string): void {
+  const counts = denialCounts.get(sessionID);
+  if (counts) {
+    counts.consecutive = 0;
+    denialCounts.set(sessionID, counts);
+  }
+}
+
+function escalate(
+  event: Evaluation,
+  reviewID: string,
+  failReason: string,
+  log: ReturnType<typeof createLogger>,
+): void {
+  log.log(`escalating to user: ${failReason}`);
+  recordDecision({ requestID: reviewID, sessionID: event.sessionID, decision: "ask", reason: failReason, at: Date.now() });
+  noteApproval(event.sessionID);
+  event.effect = "ask";
+  event.message = failReason;
+}
+
 async function attemptReview(
-  ctx: GenerateContext,
-  req: PermissionRequest,
+  ctx: PluginContext,
+  prompt: string,
   sessionID: string,
   reviewerModel: ReviewerModel | undefined,
   log: ReturnType<typeof createLogger>,
@@ -206,13 +314,7 @@ async function attemptReview(
     try {
       return await withTimeout(
         ctx.generate.text(
-          {
-            prompt: buildReviewPrompt(req),
-            model: reviewerModel ?? null,
-          },
-          // Identify the originating session so OpenCode Go / Zen can route
-          // requests from the same session to the same provider and optimize
-          // prompt caching.
+          { prompt, model: reviewerModel ?? null },
           { headers: { "x-opencode-session": sessionID } },
         ),
         REVIEW_TIMEOUT_MS,
@@ -226,17 +328,13 @@ async function attemptReview(
     }
   }
 
-  // All attempts failed — fall back to the user rather than blocking forever.
   log.log("all review attempts failed — falling back to user");
   return undefined;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`review timed out after ${ms}ms`)),
-      ms,
-    );
+    const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
     promise.then(
       (value) => {
         clearTimeout(timer);

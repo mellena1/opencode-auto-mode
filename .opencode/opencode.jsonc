@@ -1,14 +1,15 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  // The plugin is registered in the author's global config (pointing at
-  // ../src/index.ts) so local changes are tested in every project, including
-  // this one. A second registration here would collide (Duplicate plugin ID).
+  // The plugin is registered in the author's global config (pointing at the
+  // repo directory, which the server resolves via its root index.ts) so
+  // local changes are tested in every project, including this one.
+  // A second registration here would collide (Duplicate plugin ID).
   // For standalone use, uncomment and remove the global registration:
   // "plugins": [
   //   {
-  //     "package": "../src/index.ts",
+  //     "package": "..",
   //     "options": {
-  //       "model": { "id": "deepseek-v4-flash", "providerID": "opencode-go" }
+  //       "model": { "id": "deepseek-v4-flash", "providerID": "opencode" }
   //     }
   //   }
   // ],

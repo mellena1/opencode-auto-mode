@@ -46,14 +46,23 @@ Inspired by [pi-auto-reviewer](https://github.com/vinzenzu/pi-auto-reviewer):
 
 - **Tier 1 (auto-allow, instant, no LLM cost)**: safe read-only commands —
   `ls`, `cat`, `grep`, `git status`, `git log`, `git diff`, `echo`,
-  `whoami`, `pwd`, `npm list`, read/glob/grep actions, etc.
+  `whoami`, `pwd`, `npm list`, read/glob/grep actions, etc. File
+  writes/edits inside the project directory are also auto-allowed
+  (reviewable via version control); edits outside it go to review.
 
 - **Tier 2 (auto-deny, instant)**: catastrophic commands — `rm -rf /`,
   `sudo`, `chmod 777`, `dd`, `mkfs`, `shutdown`, `reboot`, etc.
+  Repeated denials escalate to you (3 in a row or 20 total per session).
 
-- **Tier 3 (LLM review)**: everything else → a cheap LLM decides ALLOW,
-  DENY, or ASK. Commands with pipes, redirects, command substitution, or
-  secret-looking env vars are always sent to the reviewer.
+- **Tier 3 (LLM review)**: everything else → two-stage review. Stage 1 is
+  a cheap BLOCK/ALLOW triage that errs toward blocking; only flagged
+  actions pay for stage 2 reasoning, which decides ALLOW, DENY, or ASK.
+  The reviewer sees your recent messages plus prior tool calls (assistant
+  prose and tool outputs are stripped so injections can't talk it into a
+  bad call), evaluates chained commands as one action, and applies
+  conservative intent rules: related to your goal is not the same as
+  authorized. Subagent delegations (`task`) are always reviewed, since the
+  orchestrator's instruction is not your authorization.
 
 By default tier 3 reviews **every** evaluation that reaches it, including
 actions OpenCode's rules would silently allow (only explicit configured
@@ -91,6 +100,15 @@ Add the published package to your `opencode.jsonc`:
 - **`review`** — `"all"` (default) reviews every permission evaluation that
   reaches tier 3, even ones OpenCode would silently allow. `"prompts"`
   reviews only evaluations that would prompt you anyway.
+- **`trusted` / `blocks` / `exceptions`** — override the reviewer's policy
+  slots (trust boundary, block rules, narrow carve-outs). Omit for the
+  conservative defaults.
+- **`allowInProjectEdits`** — `true` (default) auto-allows edits inside the
+  project directory. Set `false` to send them to the reviewer.
+
+Tool outputs are also screened for prompt-injection patterns (`ignore
+previous instructions`, `curl … | bash`, credential exfiltration); matches
+get a warning prepended so the agent treats them as untrusted data.
 
 You no longer need `permissions` rules like
 `{ "action": "shell", "resource": "*", "effect": "ask" }` for the plugin to
@@ -138,10 +156,13 @@ For local development, point the package field at the local checkout:
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Server plugin: registers a `permission.evaluate` hook, classifies evaluations into tiers, calls the LLM reviewer via the plugin context's `generate.text`, and sets the hook's `effect`/`message` outcome |
+| `src/index.ts` | Server plugin: registers `permission.evaluate` + `tool.execute.after` (injection screen) hooks, fetches transcript/project context, runs two-stage LLM review with denial backstop |
 | `src/tui.tsx` | TUI plugin: shows review-in-progress / needs-approval status in a top-right badge, plus manual allow/deny commands and keybindings |
-| `src/tiers.ts` | Command classification: auto-allow, auto-deny, or defer to LLM review |
-| `src/reviewer.ts` | Builds the review prompt for the LLM and parses ALLOW/DENY/ASK decisions |
+| `src/tiers.ts` | Command classification: auto-allow, auto-deny, or defer to LLM review (incl. in-project fast path) |
+| `src/reviewer.ts` | Two-stage review prompts (triage + reasoning) with intent/block policy, and ALLOW/DENY/ASK parsing |
+| `src/policy.ts` | Default trust boundary, block rules, and allow exceptions (overridable via options) |
+| `src/transcript.ts` | Minimal transcript builder: user messages + tool calls only, assistant prose/outputs stripped |
+| `src/probe.ts` | Heuristic prompt-injection screen for tool outputs |
 | `src/state.ts` | Decision records written to `/tmp` — the channel that feeds the TUI badge during review (outside the project to avoid config-reload loops) |
 | `src/logger.ts` | File logger that writes to `/tmp` — must stay outside the project to avoid triggering an infinite config reload loop |
 
@@ -176,7 +197,9 @@ To test local changes, register the checkout directly in your global config:
 {
   "plugins": [
     {
-      "package": "/path/to/opencode-auto-mode/src/index.ts",
+      // Local directory (not a file path — the server resolves <dir>/index.ts
+      // and ignores package.json exports). The repo ships that entrypoint.
+      "package": "/path/to/opencode-auto-mode",
       "options": { "model": { "id": "...", "providerID": "..." } }
     }
   ]

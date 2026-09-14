@@ -1,9 +1,19 @@
+import * as path from "node:path";
+
 export type Tier = "auto-allow" | "auto-deny" | "review" | "unknown";
 
 export interface Classification {
   tier: Tier;
   reason: string;
 }
+
+export interface ClassifyOptions {
+  projectDir?: string;
+}
+
+const SAFE_TOOL_ACTIONS = new Set(["read", "glob", "grep", "websearch"]);
+
+const DELEGATION_ACTIONS = new Set(["task", "subagent"]);
 
 const AUTO_ALLOWED_SHELL = [
   /^ls\b/,
@@ -32,15 +42,34 @@ const AUTO_BLOCKED_SHELL = [
 ];
 
 function hasShellMetacharacters(command: string): boolean {
-  if (/<|(?<![>])>(?![>])/.test(command)) return true;
-  if (/>>?|2>&1|2>/.test(command)) return true;
   if (/`|\$\(/.test(command)) return true;
+  if (/>>?|2>&1|2>/.test(command)) return true;
+  if (/<(?![a-z0-9_-]+=)/i.test(command)) return true;
   if (/(?<!\|)\|(?!\|)/.test(command)) return true;
+  if (/(&&|\|\||;)/.test(command)) return true;
   if (/\b&\s*$/.test(command)) return true;
   return false;
 }
 
-export function classify(action: string, resources: readonly string[]): Classification {
+export function isInProject(target: string, projectDir: string): boolean {
+  const resolved = path.resolve(projectDir, target);
+  const root = path.resolve(projectDir);
+  return resolved === root || resolved.startsWith(`${root}${path.sep}`);
+}
+
+function fileTargets(resources: readonly string[]): string[] {
+  return resources.filter((resource) => typeof resource === "string" && resource.length > 0);
+}
+
+export function classify(
+  action: string,
+  resources: readonly string[],
+  options?: ClassifyOptions,
+): Classification {
+  if (DELEGATION_ACTIONS.has(action)) {
+    return { tier: "review", reason: `subagent delegation ('${action}') needs intent review` };
+  }
+
   if (action === "shell") {
     const command = resources[0] ?? "";
     if (!command) return { tier: "auto-allow", reason: "empty command" };
@@ -55,7 +84,7 @@ export function classify(action: string, resources: readonly string[]): Classifi
     }
 
     if (hasShellMetacharacters(command)) {
-      return { tier: "review", reason: "contains shell metacharacters" };
+      return { tier: "review", reason: "chained or redirected command evaluated as one action" };
     }
 
     for (const pattern of AUTO_ALLOWED_SHELL) {
@@ -67,12 +96,16 @@ export function classify(action: string, resources: readonly string[]): Classifi
     return { tier: "review", reason: "unrecognized command" };
   }
 
-  if (action === "read" || action === "glob" || action === "grep") {
+  if (SAFE_TOOL_ACTIONS.has(action)) {
     return { tier: "auto-allow", reason: `safe ${action} operation` };
   }
 
-  if (action === "websearch") {
-    return { tier: "auto-allow", reason: "web search is safe" };
+  if ((action === "edit" || action === "write") && options?.projectDir) {
+    const targets = fileTargets(resources);
+    if (targets.length > 0 && targets.every((target) => isInProject(target, options.projectDir as string))) {
+      return { tier: "auto-allow", reason: "in-project edit reviewable via version control" };
+    }
+    return { tier: "review", reason: "file modification outside the project directory" };
   }
 
   if (action === "edit" || action === "write") {
