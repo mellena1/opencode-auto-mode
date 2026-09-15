@@ -1,8 +1,9 @@
 # opencode-auto-mode
 
-An OpenCode v2 server plugin that mimics **Claude Code's auto mode**: a cheap
-LLM reviews each permission request and auto-**approves**, auto-**denies**, or
-**falls back to the user** when uncertain.
+An OpenCode v2 server plugin that mimics
+[Claude Code's auto mode](https://www.anthropic.com/engineering/claude-code-auto-mode):
+a cheap LLM reviews each permission request and auto-**approves**,
+auto-**denies**, or **falls back to the user** when uncertain.
 
 ## Setup
 
@@ -122,7 +123,8 @@ explanation attached.
 
 ### Tiered review
 
-Inspired by [pi-auto-reviewer](https://github.com/vinzenzu/pi-auto-reviewer):
+Inspired by [Anthropic's Claude Code auto mode](https://www.anthropic.com/engineering/claude-code-auto-mode)
+and [pi-auto-reviewer](https://github.com/vinzenzu/pi-auto-reviewer):
 
 - **Tier 1 (auto-allow, instant, no LLM cost)**: safe read-only commands —
   `ls`, `cat`, `grep`, `git status`, `git log`, `git diff`, `echo`,
