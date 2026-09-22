@@ -1,4 +1,4 @@
-import { Plugin } from "@opencode-ai/plugin";
+import { Plugin } from "@opencode/plugin";
 import { createLogger } from "./logger.js";
 import { classify } from "./tiers.js";
 import { recordDecision } from "./state.js";
@@ -124,10 +124,7 @@ interface Evaluation {
 
 interface PluginContext {
   generate: {
-    text(
-      input: { prompt: string; model?: ReviewerModel | null },
-      requestOptions?: { headers?: Record<string, string>; signal?: AbortSignal },
-    ): Promise<{ text: string }>;
+    text(input: { prompt: string; model?: ReviewerModel | null }): Promise<{ text: string }>;
   };
   session: {
     get(input: { sessionID: string }): Promise<{ location?: { directory?: string } }>;
@@ -193,13 +190,7 @@ async function reviewWithLLM(
     isDelegation: event.action === "task" || event.action === "subagent",
   };
 
-  const stage1 = await attemptReview(
-    ctx,
-    buildStage1Prompt(req, deps.policy),
-    event.sessionID,
-    deps.reviewerModel,
-    log,
-  );
+  const stage1 = await attemptReview(ctx, buildStage1Prompt(req, deps.policy), deps.reviewerModel, log);
   if (!stage1) return escalate(event, reviewID, "auto-mode reviewer failed — please decide yourself", log);
 
   const triage = parseStage1(stage1.text);
@@ -212,13 +203,7 @@ async function reviewWithLLM(
     return;
   }
 
-  const result = await attemptReview(
-    ctx,
-    buildStage2Prompt(req, deps.policy),
-    event.sessionID,
-    deps.reviewerModel,
-    log,
-  );
+  const result = await attemptReview(ctx, buildStage2Prompt(req, deps.policy), deps.reviewerModel, log);
   if (!result) return escalate(event, reviewID, "auto-mode reviewer failed — please decide yourself", log);
 
   log.logJSON("reviewer response", result);
@@ -306,19 +291,15 @@ function escalate(
 async function attemptReview(
   ctx: PluginContext,
   prompt: string,
-  sessionID: string,
   reviewerModel: ReviewerModel | undefined,
   log: ReturnType<typeof createLogger>,
 ): Promise<{ text: string } | undefined> {
   for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt++) {
     try {
-      return await withTimeout(
-        ctx.generate.text(
-          { prompt, model: reviewerModel ?? null },
-          { headers: { "x-opencode-session": sessionID } },
-        ),
-        REVIEW_TIMEOUT_MS,
-      );
+      // Upstream generate.text takes only { prompt, model } — no session ID /
+      // headers passthrough (verified on @opencode/plugin 2.0.14), so reviews
+      // run without session affinity.
+      return await withTimeout(ctx.generate.text({ prompt, model: reviewerModel ?? null }), REVIEW_TIMEOUT_MS);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.log(`review attempt ${attempt}/${MAX_REVIEW_ATTEMPTS} failed: ${msg}`);

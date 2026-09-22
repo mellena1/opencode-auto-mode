@@ -1,8 +1,8 @@
 /** @jsxImportSource @opentui/solid */
 import { createMemo, createSignal, Show, type JSX } from "solid-js";
-import { Plugin } from "@opencode-ai/plugin/tui";
-import type { Context } from "@opencode-ai/plugin/tui/context";
-import type { ResolvedTheme } from "@opencode-ai/theme/tui";
+import { Plugin } from "@opencode/plugin/tui";
+import type { Context } from "@opencode/plugin/tui/context";
+import type { ResolvedTheme } from "@opencode/theme/tui";
 import { readDecisions } from "./state.js";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -90,12 +90,8 @@ function Badge(props: {
   // badge works regardless of how dependencies resolve.
   return (
     <box flexDirection="row" gap={1}>
-      <spinner
-        frames={SPINNER_FRAMES}
-        interval={120}
-        color={theme.text.feedback.warning.default}
-      />
-      <text fg={theme.text.feedback.warning.default}>auto-mode {label()}</text>
+      <spinner frames={SPINNER_FRAMES} interval={120} color={theme.text.feedback.warning.base} />
+      <text fg={theme.text.feedback.warning.base}>auto-mode {label()}</text>
     </box>
   );
 }
@@ -282,7 +278,7 @@ export default Plugin.define({
         await ctx.client.permission.reply({
           sessionID: pendingRequest.sessionID,
           requestID: pendingRequest.requestID,
-          reply,
+          decision: reply,
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
