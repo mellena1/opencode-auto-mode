@@ -71,7 +71,10 @@ export function classify(
   }
 
   if (action === "shell") {
-    const command = resources[0] ?? "";
+    // OpenCode can represent one shell invocation as multiple resources (for
+    // example, ["ls", "chmod 777 file"]). Classify the complete action so a
+    // safe-looking first resource cannot hide a dangerous later one.
+    const command = resources.join(" && ");
     if (!command) return { tier: "auto-allow", reason: "empty command" };
 
     for (const pattern of AUTO_BLOCKED_SHELL) {

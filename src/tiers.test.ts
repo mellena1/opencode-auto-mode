@@ -27,6 +27,22 @@ describe("classify", () => {
     }
   });
 
+  it("checks every shell resource for catastrophic patterns", () => {
+    for (const resources of [
+      ["ls", "sudo -n true"],
+      ["ls", "chmod 777 secret"],
+      ["echo safe", "rm -rf /"],
+    ]) {
+      assert.equal(classify("shell", resources).tier, "auto-deny", resources.join("; "));
+    }
+  });
+
+  it("reviews multiple shell resources as one action", () => {
+    const result = classify("shell", ["ls", "whoami"]);
+    assert.equal(result.tier, "review");
+    assert.match(result.reason, /one action/);
+  });
+
   it("sends chained or redirected commands to review as one action", () => {
     const result = classify("shell", ["git status && rm -rf /tmp/scratch"]);
     assert.equal(result.tier, "review");
